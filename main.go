@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -321,7 +322,8 @@ func (g *GmailServer) CreateDraft(ctx context.Context, to, subject, body string,
 	}
 	
 	rawMessage := headers + "\r\n" + body
-	message.Raw = rawMessage
+	// Gmail API requires base64url-encoded raw message
+	message.Raw = base64.URLEncoding.EncodeToString([]byte(rawMessage))
 
 	draft := &gmail.Draft{
 		Message: &message,
