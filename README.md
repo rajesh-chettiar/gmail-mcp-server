@@ -61,11 +61,11 @@ The server stores files in standard application data directories:
 
 **Windows:** `C:\Users\[YourUsername]\AppData\Roaming\auto-gmail\`
 - OAuth Token: `token.json`
-- Email Tone: `tone_personalization.md`
+- Email Style Guide: `personal-email-style-guide.md`
 
 **Mac/Linux:** `~/.auto-gmail/`
 - OAuth Token: `token.json`
-- Email Tone: `tone_personalization.md`
+- Email Style Guide: `personal-email-style-guide.md`
 
 Use `/server-status` in your MCP client to see exact file paths anytime.
 
@@ -73,50 +73,63 @@ Use `/server-status` in your MCP client to see exact file paths anytime.
 
 **Tools:**
 - `search_threads` - Search Gmail with queries like "from:email@example.com" or "subject:meeting"
-- `create_draft` - Create email drafts (AI will request tone resource first)
+- `create_draft` - Create email drafts (AI will request style guide first)
+- `get_personal_email_style_guide` - Get your email writing style guide (this is a temporary tool, created because most agents do not yet support fetching resources--once agents implement MCP resources better, then thsi tool can be removed)
 
 **Resources:**
-- `tone://email-style` - Your personal email writing style (auto-generated or manual)
+- `file://personal-email-style-guide` - Your personal email writing style (auto-generated or manual)
 
 **Prompts:**
 - `/generate-email-tone` - Analyze your sent emails to create personalized writing style
 - `/server-status` - Show file locations and server status
 
-## 6. Email Tone Personalization
+## 6. Personal Email Style Guide
 
-The server learns your writing style to help AI write emails that sound like you.
+The server learns your writing style to help AI write emails that sound like you. It includes your background, specific language patterns, and unique characteristics.
 
-**Automatic (Recommended):**
-1. Set `OPENAI_API_KEY` in your MCP config
-2. When AI first requests `tone://email-style`, it auto-generates from your sent emails
-3. Or manually run `/generate-email-tone` in your MCP client
+**Automatic Generation (Recommended):**
+1. Set `OPENAI_API_KEY` in your MCP config or `.env` file
+2. **NEW:** The server auto-generates your style guide on first startup if it doesn't exist
+3. It analyzes up to 25 of your most recent sent emails
+4. Creates a focused style guide with 5 key sections:
+   - Your background and professional context (inferred from emails)
+   - Specific words/phrases you actually use
+   - How you structure emails (greeting→body→closing)
+   - Your actual communication tone with examples
+   - Unique characteristics that make emails sound like you
+
+**Manual Generation:**
+- Run `/generate-email-tone` prompt in your MCP client anytime to regenerate
+- The file is saved to your app data directory (see **File Storage Locations** above)
 
 **Manual Creation/Editing:**
-1. Use `/server-status` to find your tone file location (see **File Storage Locations** above)
+1. Use `/server-status` to find your style guide location
 2. Create/edit the file with your preferences:
 
 ```markdown
-# Email Writing Style Guide
+# Personal Email Style Guide for Your Name <your@email.com>
 
-## Greeting Style
-- Use "Hi [Name]," for most emails
-- Use "Hello [Name]," for formal emails
+## 1. USER BACKGROUND
+- Your role, industry, expertise based on email patterns
 
-## Tone and Voice  
-- Keep emails concise and direct
-- Use friendly but professional tone
+## 2. WRITING PATTERNS  
+- Specific words/phrases you use frequently
+- Common expressions and verbal tics
 
-## Email Structure
-- Start with context or purpose
-- Use bullet points for lists
-- End with clear next steps
+## 3. STRUCTURE
+- How you organize emails (greeting patterns, body structure, closings)
 
-## Closing Style
-- Use "Best regards," for formal
-- Use "Thanks," for quick responses
+## 4. TONE
+- Your communication style with concrete examples
+
+## 5. SIGNATURE ELEMENTS
+- Unique characteristics that make emails distinctly yours
 ```
 
-The AI always requests this resource before writing emails, ensuring consistent personal style.
+**AI Integration:**
+- AI always calls `get_personal_email_style_guide` tool before writing emails
+- Ensures consistent personal style across all communications
+- Resource also available at `file://personal-email-style-guide` for supporting clients
 
 ## First Run
 
