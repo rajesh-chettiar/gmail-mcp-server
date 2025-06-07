@@ -1,0 +1,8 @@
+*.exe
+auto-gmail*
+*.env
+
+# files
+token.json
+candidates.md
+tone_personalization.md
