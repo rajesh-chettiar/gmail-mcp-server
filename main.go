@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"log"
@@ -16,8 +18,10 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/ledongthuc/pdf"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/nguyenthenguyen/docx"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/shared"
@@ -35,16 +39,24 @@ type GmailServer struct {
 func NewGmailServer() (*GmailServer, error) {
 	ctx := context.Background()
 
-	// Get credentials from environment variable
-	credentialsJSON := os.Getenv("GMAIL_CREDENTIALS")
-	if credentialsJSON == "" {
-		return nil, fmt.Errorf("GMAIL_CREDENTIALS environment variable not set")
+	// Get credentials from separate environment variables
+	clientID := os.Getenv("GMAIL_CLIENT_ID")
+	clientSecret := os.Getenv("GMAIL_CLIENT_SECRET")
+	
+	if clientID == "" {
+		return nil, fmt.Errorf("GMAIL_CLIENT_ID environment variable not set")
+	}
+	if clientSecret == "" {
+		return nil, fmt.Errorf("GMAIL_CLIENT_SECRET environment variable not set")
 	}
 
-	// Parse credentials
-	config, err := google.ConfigFromJSON([]byte(credentialsJSON), gmail.GmailReadonlyScope, gmail.GmailComposeScope)
-	if err != nil {
-		return nil, fmt.Errorf("unable to parse client config: %v", err)
+	// Create OAuth config from the client ID and secret
+	config := &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		RedirectURL:  "http://localhost:8080",
+		Scopes:       []string{gmail.GmailReadonlyScope, gmail.GmailComposeScope},
+		Endpoint:     google.Endpoint,
 	}
 
 	// Get token from file or perform OAuth flow
@@ -95,7 +107,7 @@ func isTokenValid(token *oauth2.Token) bool {
 		ClientID:     "",
 		ClientSecret: "",
 		Endpoint:     google.Endpoint,
-		Scopes:       []string{gmail.GmailReadonlyScope},
+		Scopes:       []string{gmail.GmailReadonlyScope, gmail.GmailComposeScope},
 	}
 	
 	client := config.Client(context.Background(), token)
@@ -288,20 +300,103 @@ func (g *GmailServer) SearchThreads(ctx context.Context, query string, maxResult
 
 		snippet = firstMessage.Snippet
 
-		results = append(results, map[string]interface{}{
+		// Collect attachment information from all messages in the thread
+		var allAttachments []map[string]interface{}
+		for _, message := range threadDetail.Messages {
+			attachments := extractAttachmentInfo(message)
+			for _, attachment := range attachments {
+				// Add message ID to each attachment for reference
+				attachment["messageId"] = message.Id
+				allAttachments = append(allAttachments, attachment)
+			}
+		}
+
+		// Get existing drafts for this thread
+		existingDrafts, err := g.getThreadDrafts(thread.Id)
+		if err != nil {
+			log.Printf("Warning: Failed to get drafts for thread %s: %v", thread.Id, err)
+			existingDrafts = []map[string]interface{}{}
+		}
+
+		threadResult := map[string]interface{}{
 			"threadId":     thread.Id,
 			"subject":      subject,
 			"from":         from,
 			"snippet":      snippet,
 			"messageCount": len(threadDetail.Messages),
-		})
+		}
+
+		// Only include attachments if there are any
+		if len(allAttachments) > 0 {
+			threadResult["attachments"] = allAttachments
+		}
+
+		// Only include drafts if there are any
+		if len(existingDrafts) > 0 {
+			threadResult["drafts"] = existingDrafts
+		}
+
+		results = append(results, threadResult)
 	}
 
 	resultJSON, _ := json.MarshalIndent(results, "", "  ")
 	return mcp.NewToolResultText(string(resultJSON)), nil
 }
 
-// CreateDraft creates a Gmail draft
+// getThreadDrafts retrieves existing drafts for a specific thread
+func (g *GmailServer) getThreadDrafts(threadID string) ([]map[string]interface{}, error) {
+	var drafts []map[string]interface{}
+	
+	// List all drafts for the user
+	draftsList, err := g.service.Users.Drafts.List(g.userID).Do()
+	if err != nil {
+		return drafts, fmt.Errorf("failed to list drafts: %v", err)
+	}
+	
+	// Check each draft to see if it belongs to this thread
+	for _, draft := range draftsList.Drafts {
+		// Get the full draft details
+		fullDraft, err := g.service.Users.Drafts.Get(g.userID, draft.Id).Do()
+		if err != nil {
+			continue // Skip drafts we can't access
+		}
+		
+		// Check if this draft belongs to the specified thread
+		if fullDraft.Message != nil && fullDraft.Message.ThreadId == threadID {
+			draftInfo := map[string]interface{}{
+				"draftId":  fullDraft.Id,
+				"threadId": fullDraft.Message.ThreadId,
+			}
+			
+			// Extract subject and snippet if available
+			if fullDraft.Message.Payload != nil {
+				for _, header := range fullDraft.Message.Payload.Headers {
+					if header.Name == "Subject" {
+						draftInfo["subject"] = header.Value
+						break
+					}
+				}
+				
+				// Extract draft body/snippet
+				if body := extractEmailBody(fullDraft.Message); body != "" {
+					// Truncate to snippet length
+					snippet := body
+					if len(snippet) > 200 {
+						snippet = snippet[:200] + "..."
+					}
+					draftInfo["snippet"] = snippet
+					draftInfo["fullBody"] = body // Include full body for LLM use
+				}
+			}
+			
+			drafts = append(drafts, draftInfo)
+		}
+	}
+	
+	return drafts, nil
+}
+
+// CreateDraft creates a Gmail draft or updates existing draft if one exists for the thread
 func (g *GmailServer) CreateDraft(ctx context.Context, to, subject, body string, threadID string) (*mcp.CallToolResult, error) {
 	var message gmail.Message
 	
@@ -345,8 +440,41 @@ func (g *GmailServer) CreateDraft(ctx context.Context, to, subject, body string,
 				}
 			}
 		}
+		
+		// Check for existing drafts in this thread and update if found
+		existingDrafts, err := g.getThreadDrafts(threadID)
+		if err == nil && len(existingDrafts) > 0 {
+			// Assume only one draft per thread (as requested)
+			existingDraftID := existingDrafts[0]["draftId"].(string)
+			
+			headers += fmt.Sprintf("Subject: %s\r\n", subject)
+			rawMessage := headers + "\r\n" + body
+			message.Raw = base64.URLEncoding.EncodeToString([]byte(rawMessage))
+			
+			draft := &gmail.Draft{
+				Id: existingDraftID,
+				Message: &message,
+			}
+			
+			updatedDraft, err := g.service.Users.Drafts.Update(g.userID, existingDraftID, draft).Do()
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("Failed to update existing draft: %v", err)), nil
+			}
+			
+			result := map[string]interface{}{
+				"draftId": updatedDraft.Id,
+				"message": "Draft updated successfully (existing draft was overwritten)",
+				"action":  "updated",
+				"to":      to,
+				"subject": subject,
+			}
+			
+			resultJSON, _ := json.MarshalIndent(result, "", "  ")
+			return mcp.NewToolResultText(string(resultJSON)), nil
+		}
 	}
 	
+	// No existing draft found or no thread ID, create new draft
 	headers += fmt.Sprintf("Subject: %s\r\n", subject)
 	rawMessage := headers + "\r\n" + body
 	
@@ -365,6 +493,7 @@ func (g *GmailServer) CreateDraft(ctx context.Context, to, subject, body string,
 	result := map[string]interface{}{
 		"draftId": createdDraft.Id,
 		"message": "Draft created successfully",
+		"action":  "created",
 		"to":      to,
 		"subject": subject,
 	}
@@ -570,6 +699,299 @@ func extractFromParts(parts []*gmail.MessagePart) string {
 	return ""
 }
 
+// extractAttachmentInfo extracts attachment information from a Gmail message
+func extractAttachmentInfo(message *gmail.Message) []map[string]interface{} {
+	var attachments []map[string]interface{}
+	
+	if message.Payload == nil {
+		return attachments
+	}
+	
+	// Check payload parts for attachments
+	extractAttachmentsFromParts(message.Payload.Parts, &attachments)
+	
+	return attachments
+}
+
+// extractAttachmentsFromParts recursively extracts attachment info from message parts
+func extractAttachmentsFromParts(parts []*gmail.MessagePart, attachments *[]map[string]interface{}) {
+	for _, part := range parts {
+		// Check if this part is an attachment
+		if part.Body != nil && part.Body.AttachmentId != "" {
+			filename := part.Filename
+			if filename == "" {
+				filename = "unnamed_attachment"
+			}
+			
+			attachment := map[string]interface{}{
+				"attachmentId": part.Body.AttachmentId,
+				"filename":     filename,
+				"mimeType":     part.MimeType,
+				"size":         part.Body.Size,
+			}
+			
+			// Mark if this is a document we can extract text from
+			if isExtractableDocument(part.MimeType, filename) {
+				attachment["extractable"] = true
+			}
+			
+			*attachments = append(*attachments, attachment)
+		}
+		
+		// Recursively check nested parts
+		if len(part.Parts) > 0 {
+			extractAttachmentsFromParts(part.Parts, attachments)
+		}
+	}
+}
+
+// isExtractableDocument checks if we can extract text from this document type
+func isExtractableDocument(mimeType, filename string) bool {
+	// Check MIME type
+	switch mimeType {
+	case "application/pdf":
+		return true
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		return true
+	case "text/plain":
+		return true
+	}
+	
+	// Check file extension as fallback
+	lowerFilename := strings.ToLower(filename)
+	return strings.HasSuffix(lowerFilename, ".pdf") ||
+		   strings.HasSuffix(lowerFilename, ".docx") ||
+		   strings.HasSuffix(lowerFilename, ".txt")
+}
+
+// ExtractAttachmentText safely extracts text content from an email attachment
+func (g *GmailServer) ExtractAttachmentText(ctx context.Context, messageID, attachmentID string) (*mcp.CallToolResult, error) {
+	// Get the message to extract attachment metadata
+	message, err := g.service.Users.Messages.Get(g.userID, messageID).Do()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to get message: %v", err)), nil
+	}
+	
+	// Debug: Print all attachment IDs found in this message
+	log.Printf("Looking for attachment ID: %s", attachmentID)
+	allAttachments := extractAttachmentInfo(message)
+	log.Printf("Found %d attachments in message:", len(allAttachments))
+	for i, att := range allAttachments {
+		log.Printf("  Attachment %d: ID=%v, filename=%v", i, att["attachmentId"], att["filename"])
+	}
+	
+	// Find the attachment part to get metadata
+	var attachmentPart *gmail.MessagePart
+	findAttachmentPart(message.Payload.Parts, attachmentID, &attachmentPart)
+	
+	if attachmentPart == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Attachment not found in message. Available attachments: %v", allAttachments)), nil
+	}
+	
+	// Get the attachment data
+	attachment, err := g.service.Users.Messages.Attachments.Get(g.userID, messageID, attachmentID).Do()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to get attachment: %v", err)), nil
+	}
+	
+	// Decode the attachment data
+	data, err := base64.URLEncoding.DecodeString(attachment.Data)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to decode attachment data: %v", err)), nil
+	}
+	
+	// Extract text based on MIME type
+	text, err := extractTextFromBytes(data, attachmentPart.MimeType, attachmentPart.Filename)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to extract text: %v", err)), nil
+	}
+	
+	result := map[string]interface{}{
+		"messageId":    messageID,
+		"attachmentId": attachmentID,
+		"filename":     attachmentPart.Filename,
+		"mimeType":     attachmentPart.MimeType,
+		"textContent":  text,
+		"extractedAt":  time.Now().Format(time.RFC3339),
+	}
+	
+	resultJSON, _ := json.MarshalIndent(result, "", "  ")
+	return mcp.NewToolResultText(string(resultJSON)), nil
+}
+
+// findAttachmentPart recursively finds the attachment part by attachment ID
+func findAttachmentPart(parts []*gmail.MessagePart, attachmentID string, result **gmail.MessagePart) {
+	for _, part := range parts {
+		if part.Body != nil && part.Body.AttachmentId == attachmentID {
+			*result = part
+			return
+		}
+		if len(part.Parts) > 0 {
+			findAttachmentPart(part.Parts, attachmentID, result)
+		}
+	}
+}
+
+// extractTextFromBytes extracts text from attachment bytes based on MIME type
+func extractTextFromBytes(data []byte, mimeType, filename string) (string, error) {
+	switch mimeType {
+	case "application/pdf":
+		return extractPDFText(data)
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		return extractDOCXText(data)
+	case "text/plain":
+		return string(data), nil
+	default:
+		// Try to infer from filename
+		lowerFilename := strings.ToLower(filename)
+		if strings.HasSuffix(lowerFilename, ".pdf") {
+			return extractPDFText(data)
+		} else if strings.HasSuffix(lowerFilename, ".docx") {
+			return extractDOCXText(data)
+		} else if strings.HasSuffix(lowerFilename, ".txt") {
+			return string(data), nil
+		}
+		return "", fmt.Errorf("unsupported file type: %s", mimeType)
+	}
+}
+
+// extractPDFText safely extracts text from PDF bytes
+func extractPDFText(data []byte) (string, error) {
+	reader := bytes.NewReader(data)
+	
+	// Open PDF reader
+	pdfReader, err := pdf.NewReader(reader, int64(len(data)))
+	if err != nil {
+		return "", fmt.Errorf("failed to open PDF: %v", err)
+	}
+	
+	var textContent strings.Builder
+	numPages := pdfReader.NumPage()
+	
+	// Limit to first 50 pages to avoid excessive processing
+	maxPages := numPages
+	if maxPages > 50 {
+		maxPages = 50
+	}
+	
+	for i := 1; i <= maxPages; i++ {
+		page := pdfReader.Page(i)
+		if page.V.IsNull() {
+			continue
+		}
+		
+		// Extract text with empty font map (safe extraction)
+		text, err := page.GetPlainText(map[string]*pdf.Font{})
+		if err != nil {
+			// Continue with other pages if one fails
+			continue
+		}
+		
+		textContent.WriteString(text)
+		textContent.WriteString("\n\n")
+	}
+	
+	extractedText := textContent.String()
+	if len(extractedText) == 0 {
+		return "", fmt.Errorf("no text could be extracted from PDF")
+	}
+	
+	// Add truncation notice if we hit the page limit
+	if numPages > 50 {
+		extractedText += fmt.Sprintf("\n\n[Note: PDF has %d pages total, but only first 50 pages were processed for safety]", numPages)
+	}
+	
+	return extractedText, nil
+}
+
+// extractDOCXText safely extracts text from DOCX bytes
+func extractDOCXText(data []byte) (string, error) {
+	// Create a temporary file since the docx library works with files
+	tempFile, err := os.CreateTemp("", "docx_extract_*.docx")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
+	
+	// Write data to temp file
+	if _, err := tempFile.Write(data); err != nil {
+		return "", fmt.Errorf("failed to write temp file: %v", err)
+	}
+	tempFile.Close()
+	
+	// Read DOCX from the temporary file
+	doc, err := docx.ReadDocxFile(tempFile.Name())
+	if err != nil {
+		return "", fmt.Errorf("failed to open DOCX: %v", err)
+	}
+	
+	// Get the raw content (which may be XML)
+	rawContent := doc.Editable().GetContent()
+	if len(rawContent) == 0 {
+		return "", fmt.Errorf("no text could be extracted from DOCX")
+	}
+	
+	// Try to extract plain text from XML if the content looks like XML
+	if strings.HasPrefix(strings.TrimSpace(rawContent), "<?xml") || strings.HasPrefix(strings.TrimSpace(rawContent), "<") {
+		plainText := extractTextFromXML(rawContent)
+		if len(plainText) > 0 {
+			return plainText, nil
+		}
+		// If XML parsing fails, fall back to raw content
+	}
+	
+	return rawContent, nil
+}
+
+// extractTextFromXML extracts plain text content from DOCX XML
+func extractTextFromXML(xmlContent string) string {
+	var textParts []string
+	
+	// Create a decoder for the XML content
+	decoder := xml.NewDecoder(strings.NewReader(xmlContent))
+	
+	// Track if we're inside a <w:t> element
+	var insideTextElement bool
+	
+	for {
+		// Read the next token
+		token, err := decoder.Token()
+		if err != nil {
+			break // End of document or error
+		}
+		
+		switch t := token.(type) {
+		case xml.StartElement:
+			// Check if this is a text element
+			if t.Name.Local == "t" && t.Name.Space == "http://schemas.openxmlformats.org/wordprocessingml/2006/main" {
+				insideTextElement = true
+			}
+		case xml.EndElement:
+			// Check if we're leaving a text element
+			if t.Name.Local == "t" && t.Name.Space == "http://schemas.openxmlformats.org/wordprocessingml/2006/main" {
+				insideTextElement = false
+			}
+		case xml.CharData:
+			// If we're inside a text element, collect the text
+			if insideTextElement {
+				text := strings.TrimSpace(string(t))
+				if text != "" {
+					textParts = append(textParts, text)
+				}
+			}
+		}
+	}
+	
+	// Join all text parts with spaces and clean up
+	result := strings.Join(textParts, " ")
+	
+	// Clean up extra whitespace while preserving meaningful breaks
+	// Split by multiple spaces and rejoin with single spaces
+	words := strings.Fields(result)
+	return strings.Join(words, " ")
+}
+
 // getAppDataDir returns the application data directory
 func getAppDataDir() string {
 	var appDataDir string
@@ -761,7 +1183,7 @@ func main() {
 			toneExists = "✅ Found"
 		}
 
-		statusMessage := fmt.Sprintf("📊 **Gmail MCP Server Status**\n\n📁 **App Data Directory:** %s\n\n🔑 **Token File:** %s\n   Status: %s\n\n📝 **Style Guide File:** %s\n   Status: %s\n\n🛠️ **Available Commands:**\n- Use /generate-email-tone to create email tone personalization\n- Use tools: search_threads, create_draft\n- Use resource: file://personal-email-style-guide", 
+		statusMessage := fmt.Sprintf("📊 **Gmail MCP Server Status**\n\n📁 **App Data Directory:** %s\n\n🔑 **Token File:** %s\n   Status: %s\n\n📝 **Style Guide File:** %s\n   Status: %s\n\n🛠️ **Available Commands:**\n- Use /generate-email-tone to create email tone personalization\n- Use tools: search_threads (includes drafts), create_draft (create/update), extract_attachment_by_filename\n- Use resource: file://personal-email-style-guide", 
 			getAppDataDir(), tokenPath, tokenExists, tonePath, toneExists)
 
 		return &mcp.GetPromptResult{
@@ -857,7 +1279,7 @@ EXAMPLE QUERIES:
 
 	// Add Create Draft tool
 	createDraftTool := mcp.NewTool("create_draft",
-		mcp.WithDescription("Create a Gmail draft email. Important: Before writing any email, always request the file://personal-email-style-guide resource to understand the user's writing style and preferences."),
+		mcp.WithDescription("Create a Gmail draft email or update an existing draft if one exists for the thread. When a thread_id is provided, this tool will check for existing drafts in that thread and overwrite them, allowing LLMs to iteratively modify draft content. Important: Before writing any email, always request the file://personal-email-style-guide resource to understand the user's writing style and preferences."),
 		mcp.WithString("to",
 			mcp.Required(),
 			mcp.Description("Recipient email address"),
@@ -871,7 +1293,7 @@ EXAMPLE QUERIES:
 			mcp.Description("Email body content"),
 		),
 		mcp.WithString("thread_id",
-			mcp.Description("Thread ID if this is a reply (optional)"),
+			mcp.Description("Thread ID if this is a reply (optional). If provided and a draft exists for this thread, the existing draft will be updated instead of creating a new one."),
 		),
 	)
 
@@ -937,6 +1359,60 @@ EXAMPLE QUERIES:
 		return mcp.NewToolResultText(string(content)), nil
 	})
 
+	// Add Extract Attachment Text tool
+	extractAttachmentTool := mcp.NewTool("extract_attachment_by_filename",
+		mcp.WithDescription("Safely extract text content from email attachments (PDF, DOCX, TXT). Use search_threads first to find emails with attachments, then use this tool to extract readable text from specific attachments. This provides a safe way to read document content without downloading or opening potentially dangerous files."),
+		mcp.WithString("message_id",
+			mcp.Required(),
+			mcp.Description("The Gmail message ID containing the attachment (from search_threads results)"),
+		),
+		mcp.WithString("attachment_id",
+			mcp.Required(),
+			mcp.Description("The Gmail attachment ID to extract text from (from search_threads results)"),
+		),
+	)
+
+	mcpServer.AddTool(extractAttachmentTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		messageID, err := req.RequireString("message_id")
+		if err != nil {
+			return mcp.NewToolResultError("message_id parameter is required and must be a string"), nil
+		}
+
+		attachmentID, err := req.RequireString("attachment_id")
+		if err != nil {
+			return mcp.NewToolResultError("attachment_id parameter is required and must be a string"), nil
+		}
+
+		return gmailServer.ExtractAttachmentText(ctx, messageID, attachmentID)
+	})
+
+	// Add Extract Attachment By Filename tool - more reliable than attachment ID
+	extractByFilenameTool := mcp.NewTool("extract_attachment_by_filename",
+		mcp.WithDescription("Safely extract text content from email attachments by filename (more reliable than attachment ID). Use search_threads first to find emails with attachments, then use this tool to extract readable text from specific files by name."),
+		mcp.WithString("message_id",
+			mcp.Required(),
+			mcp.Description("The Gmail message ID containing the attachment (from search_threads results)"),
+		),
+		mcp.WithString("filename",
+			mcp.Required(),
+			mcp.Description("The filename of the attachment to extract (e.g., 'document.pdf', 'CV.docx')"),
+		),
+	)
+
+	mcpServer.AddTool(extractByFilenameTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		messageID, err := req.RequireString("message_id")
+		if err != nil {
+			return mcp.NewToolResultError("message_id parameter is required and must be a string"), nil
+		}
+
+		filename, err := req.RequireString("filename")
+		if err != nil {
+			return mcp.NewToolResultError("filename parameter is required and must be a string"), nil
+		}
+
+		return gmailServer.ExtractAttachmentByFilename(ctx, messageID, filename)
+	})
+
 	// Start the server
 	log.Println("Starting Gmail MCP Server...")
 	log.Println("✅ Server ready! Waiting for MCP client connections via stdio...")
@@ -945,4 +1421,73 @@ EXAMPLE QUERIES:
 	if err := server.ServeStdio(mcpServer); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
+}
+
+// ExtractAttachmentByFilename safely extracts text content from an email attachment by filename
+// This is more reliable than using attachment IDs which are unstable in Gmail API
+func (g *GmailServer) ExtractAttachmentByFilename(ctx context.Context, messageID, filename string) (*mcp.CallToolResult, error) {
+	// Get the message to find attachments
+	message, err := g.service.Users.Messages.Get(g.userID, messageID).Do()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to get message: %v", err)), nil
+	}
+	
+	// Find all attachments in the message
+	allAttachments := extractAttachmentInfo(message)
+	
+	// Look for the attachment with matching filename
+	var targetAttachment map[string]interface{}
+	var attachmentPart *gmail.MessagePart
+	
+	for _, attachment := range allAttachments {
+		if attachment["filename"] == filename {
+			targetAttachment = attachment
+			attachmentID := attachment["attachmentId"].(string)
+			findAttachmentPart(message.Payload.Parts, attachmentID, &attachmentPart)
+			break
+		}
+	}
+	
+	if targetAttachment == nil {
+		availableFiles := make([]string, 0, len(allAttachments))
+		for _, att := range allAttachments {
+			availableFiles = append(availableFiles, att["filename"].(string))
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("Attachment with filename '%s' not found. Available files: %v", filename, availableFiles)), nil
+	}
+	
+	if attachmentPart == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Could not find attachment part for filename '%s'", filename)), nil
+	}
+	
+	// Get the attachment data using the current attachment ID
+	attachmentID := targetAttachment["attachmentId"].(string)
+	attachment, err := g.service.Users.Messages.Attachments.Get(g.userID, messageID, attachmentID).Do()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to get attachment data: %v", err)), nil
+	}
+	
+	// Decode the attachment data
+	data, err := base64.URLEncoding.DecodeString(attachment.Data)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to decode attachment data: %v", err)), nil
+	}
+	
+	// Extract text based on MIME type
+	text, err := extractTextFromBytes(data, attachmentPart.MimeType, attachmentPart.Filename)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to extract text: %v", err)), nil
+	}
+	
+	result := map[string]interface{}{
+		"messageId":    messageID,
+		"filename":     filename,
+		"attachmentId": attachmentID,
+		"mimeType":     attachmentPart.MimeType,
+		"textContent":  text,
+		"extractedAt":  time.Now().Format(time.RFC3339),
+	}
+	
+	resultJSON, _ := json.MarshalIndent(result, "", "  ")
+	return mcp.NewToolResultText(string(resultJSON)), nil
 }
