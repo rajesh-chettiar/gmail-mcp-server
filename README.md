@@ -144,3 +144,7 @@ The server stores authentication and configuration files in standard application
 ### Quick Commands:
 - Use `/server-status` in your MCP client to see exact file paths
 - Delete `token.json` to force re-authentication with updated permissions
+
+## 7. TODOs
+
+- [ ] **Improve OAuth login flow** - Currently the MCP server pops up browser authentication every time you open Cursor; that's really annoying. I think Cursor supports oAuth better than this.

@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	htmltomarkdown "github.com/JohannesKaufmann/html-to-markdown/v2"
 	"github.com/joho/godotenv"
 	"github.com/ledongthuc/pdf"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -298,6 +298,7 @@ func (g *GmailServer) SearchThreads(ctx context.Context, query string, maxResult
 			}
 		}
 
+		// Use Gmail's built-in snippet for fast browsing (typically ~150 characters)
 		snippet = firstMessage.Snippet
 
 		// Collect attachment information from all messages in the thread
@@ -385,7 +386,6 @@ func (g *GmailServer) getThreadDrafts(threadID string) ([]map[string]interface{}
 						snippet = snippet[:200] + "..."
 					}
 					draftInfo["snippet"] = snippet
-					draftInfo["fullBody"] = body // Include full body for LLM use
 				}
 			}
 			
@@ -650,53 +650,105 @@ Start with "# Personal Email Style Guide for %s"`, len(emailBodies), profile.Ema
 	return nil
 }
 
-// extractEmailBody extracts readable text from a Gmail message
+// extractEmailBody extracts readable text from a Gmail message, preserving links and semantic information
 func extractEmailBody(msg *gmail.Message) string {
 	if msg.Payload == nil {
 		return ""
 	}
 
-	// Try to get text from plain text part
+	// Try to get content from message body or parts
+	var plainTextContent, htmlContent string
+
+	// Check if there's direct body content
 	if msg.Payload.Body != nil && msg.Payload.Body.Data != "" {
-		// Decode base64url-encoded data
-		decoded, err := base64.URLEncoding.DecodeString(msg.Payload.Body.Data)
-		if err != nil {
-			// Try standard base64 if URL encoding fails
-			decoded, err = base64.StdEncoding.DecodeString(msg.Payload.Body.Data)
-			if err != nil {
-				return ""
+		decoded, err := decodeEmailContent(msg.Payload.Body.Data)
+		if err == nil {
+			if msg.Payload.MimeType == "text/html" {
+				htmlContent = decoded
+			} else {
+				plainTextContent = decoded
 			}
 		}
-		return string(decoded)
 	}
 
-	// For multipart messages, find the text/plain part
-	return extractFromParts(msg.Payload.Parts)
+	// For multipart messages, extract from parts
+	if len(msg.Payload.Parts) > 0 {
+		plainFromParts, htmlFromParts := extractFromParts(msg.Payload.Parts)
+		if plainFromParts != "" {
+			plainTextContent = plainFromParts
+		}
+		if htmlFromParts != "" {
+			htmlContent = htmlFromParts
+		}
+	}
+
+	// Prefer HTML content when available since it contains more semantic information
+	if htmlContent != "" {
+		return extractTextAndLinksFromHTML(htmlContent)
+	}
+
+	return plainTextContent
 }
 
-// extractFromParts recursively extracts text from message parts
-func extractFromParts(parts []*gmail.MessagePart) string {
+// extractFromParts recursively extracts both plain text and HTML content from message parts
+func extractFromParts(parts []*gmail.MessagePart) (plainText, htmlText string) {
 	for _, part := range parts {
-		if part.MimeType == "text/plain" && part.Body != nil && part.Body.Data != "" {
-			// Decode base64url-encoded data
-			decoded, err := base64.URLEncoding.DecodeString(part.Body.Data)
+		if part.Body != nil && part.Body.Data != "" {
+			decoded, err := decodeEmailContent(part.Body.Data)
 			if err != nil {
-				// Try standard base64 if URL encoding fails
-				decoded, err = base64.StdEncoding.DecodeString(part.Body.Data)
-				if err != nil {
-					continue
+				continue
+			}
+
+			switch part.MimeType {
+			case "text/plain":
+				if plainText == "" { // Take the first plain text part
+					plainText = decoded
+				}
+			case "text/html":
+				if htmlText == "" { // Take the first HTML part
+					htmlText = decoded
 				}
 			}
-			return string(decoded)
 		}
+
 		// Recursively check nested parts
 		if len(part.Parts) > 0 {
-			if text := extractFromParts(part.Parts); text != "" {
-				return text
+			nestedPlain, nestedHTML := extractFromParts(part.Parts)
+			if plainText == "" && nestedPlain != "" {
+				plainText = nestedPlain
+			}
+			if htmlText == "" && nestedHTML != "" {
+				htmlText = nestedHTML
 			}
 		}
 	}
-	return ""
+	return plainText, htmlText
+}
+
+// decodeEmailContent decodes base64url or base64 encoded email content
+func decodeEmailContent(data string) (string, error) {
+	// Try base64url decoding first (Gmail's preferred encoding)
+	decoded, err := base64.URLEncoding.DecodeString(data)
+	if err != nil {
+		// Try standard base64 if URL encoding fails
+		decoded, err = base64.StdEncoding.DecodeString(data)
+		if err != nil {
+			return "", err
+		}
+	}
+	return string(decoded), nil
+}
+
+// extractTextAndLinksFromHTML uses html-to-markdown library to convert HTML to proper markdown with preserved links
+func extractTextAndLinksFromHTML(htmlContent string) string {
+	// Use JohannesKaufmann/html-to-markdown/v2 library for proper markdown conversion
+	markdown, err := htmltomarkdown.ConvertString(htmlContent)
+	if err != nil {
+		// Fallback to returning the HTML as-is if conversion fails
+		return htmlContent
+	}
+	
+	return strings.TrimSpace(markdown)
 }
 
 // extractAttachmentInfo extracts attachment information from a Gmail message
@@ -1023,10 +1075,31 @@ func getAppFilePath(filename string) string {
 	return filepath.Join(getAppDataDir(), filename)
 }
 
-func main() {
-	// Parse command line flags (none needed now)
-	flag.Parse()
+// ensureStyleGuideExists checks if the style guide exists and auto-generates it if needed
+func ensureStyleGuideExists(gmailServer *GmailServer) error {
+	toneFilePath := getAppFilePath("personal-email-style-guide.md")
+	
+	// Check if file already exists
+	if _, err := os.Stat(toneFilePath); err == nil {
+		return nil // File exists, nothing to do
+	}
+	
+	// File doesn't exist, try to auto-generate
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		return fmt.Errorf("personal email style guide not found at %s and OPENAI_API_KEY not set. Please either set OPENAI_API_KEY for auto-generation or create the file manually", toneFilePath)
+	}
+	
+	log.Println("📝 Style guide not found, auto-generating from your sent emails...")
+	if err := GeneratePersonalEmailStyleGuide(gmailServer); err != nil {
+		return fmt.Errorf("personal email style guide not found at %s and auto-generation failed: %v. Please create the file manually or set OPENAI_API_KEY", toneFilePath, err)
+	}
+	
+	log.Println("✅ Personal email style guide auto-generated successfully!")
+	return nil
+}
 
+func main() {
 	// Load environment variables from .env file if it exists
 	err := godotenv.Load()
 	if err == nil {
@@ -1045,24 +1118,8 @@ func main() {
 	}
 
 	// Auto-generate tone personalization file if it doesn't exist
-	toneFilePath := getAppFilePath("personal-email-style-guide.md")
-	if _, err := os.Stat(toneFilePath); os.IsNotExist(err) {
-		log.Println("📝 Personal email style guide not found, checking if we can auto-generate...")
-		apiKey := os.Getenv("OPENAI_API_KEY")
-		if apiKey != "" {
-			log.Println("🤖 Auto-generating personal email style guide from your sent emails...")
-			if genErr := GeneratePersonalEmailStyleGuide(gmailServer); genErr != nil {
-				log.Printf("⚠️  Failed to auto-generate style guide: %v", genErr)
-				log.Printf("📝 You can manually create %s or run /generate-email-tone later", toneFilePath)
-			} else {
-				log.Println("✅ Personal email style guide auto-generated successfully!")
-			}
-		} else {
-			log.Printf("📝 Style guide not found and OPENAI_API_KEY not set")
-			log.Printf("   Set OPENAI_API_KEY for auto-generation or manually create: %s", toneFilePath)
-		}
-	} else {
-		log.Printf("📝 Using existing personal email style guide: %s", toneFilePath)
+	if err := ensureStyleGuideExists(gmailServer); err != nil {
+		log.Printf("⚠️  %v", err)
 	}
 
 	// Normal MCP server operation
@@ -1090,20 +1147,13 @@ func main() {
 		if err != nil {
 			// If file doesn't exist, try to generate it automatically
 			if os.IsNotExist(err) {
-				apiKey := os.Getenv("OPENAI_API_KEY")
-				if apiKey != "" {
-					log.Println("📝 Style guide not found, auto-generating from your sent emails...")
-					if genErr := GeneratePersonalEmailStyleGuide(gmailServer); genErr != nil {
-						return nil, fmt.Errorf("personal email style guide not found at %s and auto-generation failed: %v. Please create the file manually or set OPENAI_API_KEY", toneFilePath, genErr)
-					}
-					// Try reading again after generation
-					content, err = os.ReadFile(toneFilePath)
-					if err != nil {
-						return nil, fmt.Errorf("failed to read generated style guide: %v", err)
-					}
-					log.Println("✅ Personal email style guide auto-generated successfully!")
-				} else {
-					return nil, fmt.Errorf("personal email style guide not found at %s and OPENAI_API_KEY not set. Please either set OPENAI_API_KEY for auto-generation or create the file manually", toneFilePath)
+				if genErr := ensureStyleGuideExists(gmailServer); genErr != nil {
+					return nil, genErr
+				}
+				// Try reading again after generation
+				content, err = os.ReadFile(toneFilePath)
+				if err != nil {
+					return nil, fmt.Errorf("failed to read generated style guide: %v", err)
 				}
 			} else {
 				return nil, fmt.Errorf("failed to read style guide at %s: %v", toneFilePath, err)
@@ -1336,20 +1386,13 @@ EXAMPLE QUERIES:
 		if err != nil {
 			if os.IsNotExist(err) {
 				// Try to auto-generate if file doesn't exist
-				apiKey := os.Getenv("OPENAI_API_KEY")
-				if apiKey != "" {
-					log.Println("📝 Style guide not found, auto-generating from your sent emails...")
-					if genErr := GeneratePersonalEmailStyleGuide(gmailServer); genErr != nil {
-						return mcp.NewToolResultError(fmt.Sprintf("Personal email style guide not found at %s and auto-generation failed: %v. Please create the file manually or set OPENAI_API_KEY", styleFilePath, genErr)), nil
-					}
-					// Try reading again after generation
-					content, err = os.ReadFile(styleFilePath)
-					if err != nil {
-						return mcp.NewToolResultError(fmt.Sprintf("Failed to read generated style guide: %v", err)), nil
-					}
-					log.Println("✅ Personal email style guide auto-generated successfully!")
-				} else {
-					return mcp.NewToolResultError(fmt.Sprintf("Personal email style guide not found at %s and OPENAI_API_KEY not set. Please either set OPENAI_API_KEY for auto-generation or create the file manually", styleFilePath)), nil
+				if genErr := ensureStyleGuideExists(gmailServer); genErr != nil {
+					return mcp.NewToolResultError(genErr.Error()), nil
+				}
+				// Try reading again after generation
+				content, err = os.ReadFile(styleFilePath)
+				if err != nil {
+					return mcp.NewToolResultError(fmt.Sprintf("Failed to read generated style guide: %v", err)), nil
 				}
 			} else {
 				return mcp.NewToolResultError(fmt.Sprintf("Failed to read style guide at %s: %v", styleFilePath, err)), nil
@@ -1359,36 +1402,9 @@ EXAMPLE QUERIES:
 		return mcp.NewToolResultText(string(content)), nil
 	})
 
-	// Add Extract Attachment Text tool
-	extractAttachmentTool := mcp.NewTool("extract_attachment_by_filename",
-		mcp.WithDescription("Safely extract text content from email attachments (PDF, DOCX, TXT). Use search_threads first to find emails with attachments, then use this tool to extract readable text from specific attachments. This provides a safe way to read document content without downloading or opening potentially dangerous files."),
-		mcp.WithString("message_id",
-			mcp.Required(),
-			mcp.Description("The Gmail message ID containing the attachment (from search_threads results)"),
-		),
-		mcp.WithString("attachment_id",
-			mcp.Required(),
-			mcp.Description("The Gmail attachment ID to extract text from (from search_threads results)"),
-		),
-	)
-
-	mcpServer.AddTool(extractAttachmentTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		messageID, err := req.RequireString("message_id")
-		if err != nil {
-			return mcp.NewToolResultError("message_id parameter is required and must be a string"), nil
-		}
-
-		attachmentID, err := req.RequireString("attachment_id")
-		if err != nil {
-			return mcp.NewToolResultError("attachment_id parameter is required and must be a string"), nil
-		}
-
-		return gmailServer.ExtractAttachmentText(ctx, messageID, attachmentID)
-	})
-
 	// Add Extract Attachment By Filename tool - more reliable than attachment ID
 	extractByFilenameTool := mcp.NewTool("extract_attachment_by_filename",
-		mcp.WithDescription("Safely extract text content from email attachments by filename (more reliable than attachment ID). Use search_threads first to find emails with attachments, then use this tool to extract readable text from specific files by name."),
+		mcp.WithDescription("Safely extract text content from email attachments by filename (do not use attachment-id). Use search_threads first to find emails with attachments, then use this tool to extract readable text from specific files by name."),
 		mcp.WithString("message_id",
 			mcp.Required(),
 			mcp.Description("The Gmail message ID containing the attachment (from search_threads results)"),
@@ -1411,6 +1427,50 @@ EXAMPLE QUERIES:
 		}
 
 		return gmailServer.ExtractAttachmentByFilename(ctx, messageID, filename)
+	})
+
+	// Add Fetch Email Bodies tool for selective full content retrieval
+	fetchEmailBodiesTool := mcp.NewTool("fetch_email_bodies",
+		mcp.WithDescription("Fetch full email bodies for specific threads after browsing with snippets. Can fetch multiple emails at once for efficient selective content retrieval."),
+		mcp.WithArray("thread_ids",
+			mcp.Required(),
+			mcp.Description("List of thread IDs to fetch full email content for (from search_threads results)"),
+		),
+	)
+
+	mcpServer.AddTool(fetchEmailBodiesTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+		threadIDsRaw, ok := args["thread_ids"]
+		if !ok {
+			return mcp.NewToolResultError("thread_ids parameter is required"), nil
+		}
+
+		// Convert to array of interfaces first
+		threadIDsArray, ok := threadIDsRaw.([]interface{})
+		if !ok {
+			return mcp.NewToolResultError("thread_ids must be an array"), nil
+		}
+
+		// Convert interface{} array to []string
+		var threadIDs []string
+		for _, idRaw := range threadIDsArray {
+			if idStr, ok := idRaw.(string); ok {
+				threadIDs = append(threadIDs, idStr)
+			} else {
+				return mcp.NewToolResultError("All thread_ids must be strings"), nil
+			}
+		}
+
+		if len(threadIDs) == 0 {
+			return mcp.NewToolResultError("At least one thread_id must be provided"), nil
+		}
+
+		// Limit to prevent overwhelming requests
+		if len(threadIDs) > 20 {
+			return mcp.NewToolResultError("Maximum 20 thread_ids allowed per request"), nil
+		}
+
+		return gmailServer.FetchEmailBodies(ctx, threadIDs)
 	})
 
 	// Start the server
@@ -1489,5 +1549,90 @@ func (g *GmailServer) ExtractAttachmentByFilename(ctx context.Context, messageID
 	}
 	
 	resultJSON, _ := json.MarshalIndent(result, "", "  ")
+	return mcp.NewToolResultText(string(resultJSON)), nil
+}
+
+// FetchEmailBodies fetches full email content for multiple threads
+func (g *GmailServer) FetchEmailBodies(ctx context.Context, threadIDs []string) (*mcp.CallToolResult, error) {
+	var results []map[string]interface{}
+	
+	for _, threadID := range threadIDs {
+		// Get thread details directly from Gmail API
+		threadDetail, err := g.service.Users.Threads.Get(g.userID, threadID).Do()
+		if err != nil {
+			log.Printf("Warning: Failed to get thread %s: %v", threadID, err)
+			continue
+		}
+
+		if len(threadDetail.Messages) == 0 {
+			continue
+		}
+
+		// Extract details from the first message
+		firstMessage := threadDetail.Messages[0]
+		var subject, from string
+
+		// Extract headers
+		for _, header := range firstMessage.Payload.Headers {
+			switch header.Name {
+			case "Subject":
+				subject = header.Value
+			case "From":
+				from = header.Value
+			}
+		}
+
+		// Extract full email body content with markdown formatting
+		fullBody := extractEmailBody(firstMessage)
+		
+		// Limit full body to prevent overwhelming the context (8000 chars = ~2000 tokens)
+		if len(fullBody) > 8000 {
+			fullBody = fullBody[:8000] + "\n\n[Content truncated - email is longer than 8000 characters]"
+		}
+
+		// Collect attachment information from all messages in the thread
+		var allAttachments []map[string]interface{}
+		for _, message := range threadDetail.Messages {
+			attachments := extractAttachmentInfo(message)
+			for _, attachment := range attachments {
+				// Add message ID to each attachment for reference
+				attachment["messageId"] = message.Id
+				allAttachments = append(allAttachments, attachment)
+			}
+		}
+
+		// Get existing drafts for this thread
+		existingDrafts, err := g.getThreadDrafts(threadID)
+		if err != nil {
+			log.Printf("Warning: Failed to get drafts for thread %s: %v", threadID, err)
+			existingDrafts = []map[string]interface{}{}
+		}
+
+		threadResult := map[string]interface{}{
+			"threadId":     threadID,
+			"subject":      subject,
+			"from":         from,
+			"fullBody":     fullBody,
+			"messageCount": len(threadDetail.Messages),
+		}
+
+		// Only include attachments if there are any
+		if len(allAttachments) > 0 {
+			threadResult["attachments"] = allAttachments
+		}
+
+		// Only include drafts if there are any
+		if len(existingDrafts) > 0 {
+			threadResult["drafts"] = existingDrafts
+		}
+
+		results = append(results, threadResult)
+	}
+	
+	resultJSON, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to marshal results: %v", err)), nil
+	}
+	
 	return mcp.NewToolResultText(string(resultJSON)), nil
 }
