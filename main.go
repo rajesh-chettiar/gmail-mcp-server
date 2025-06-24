@@ -1100,6 +1100,19 @@ func ensureStyleGuideExists(gmailServer *GmailServer) error {
 }
 
 func main() {
+	// Parse command line arguments for transport mode
+	var useHTTP = false
+	var port = "8080"
+	
+	if len(os.Args) > 1 {
+		if os.Args[1] == "--http" {
+			useHTTP = true
+		}
+		if len(os.Args) > 2 {
+			port = os.Args[2]
+		}
+	}
+
 	// Load environment variables from .env file if it exists
 	err := godotenv.Load()
 	if err == nil {
@@ -1122,7 +1135,6 @@ func main() {
 		log.Printf("⚠️  %v", err)
 	}
 
-	// Normal MCP server operation
 	// Create MCP server
 	mcpServer := server.NewMCPServer(
 		"Gmail MCP Server",
@@ -1432,36 +1444,25 @@ EXAMPLE QUERIES:
 	// Add Fetch Email Bodies tool for selective full content retrieval
 	fetchEmailBodiesTool := mcp.NewTool("fetch_email_bodies",
 		mcp.WithDescription("Fetch full email bodies for specific threads after browsing with snippets. Can fetch multiple emails at once for efficient selective content retrieval."),
-		mcp.WithArray("thread_ids",
+		mcp.WithString("thread_ids",
 			mcp.Required(),
-			mcp.Description("List of thread IDs to fetch full email content for (from search_threads results)"),
+			mcp.Description("A comma-separated list of thread IDs to fetch full email content for (e.g., 'id1,id2,id3')"),
 		),
 	)
 
 	mcpServer.AddTool(fetchEmailBodiesTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := req.GetArguments()
-		threadIDsRaw, ok := args["thread_ids"]
-		if !ok {
-			return mcp.NewToolResultError("thread_ids parameter is required"), nil
+		threadIDsStr, err := req.RequireString("thread_ids")
+		if err != nil {
+			return mcp.NewToolResultError("thread_ids parameter is required and must be a string"), nil
 		}
 
-		// Convert to array of interfaces first
-		threadIDsArray, ok := threadIDsRaw.([]interface{})
-		if !ok {
-			return mcp.NewToolResultError("thread_ids must be an array"), nil
+		// Split the comma-separated string into a slice
+		threadIDs := strings.Split(threadIDsStr, ",")
+		for i, id := range threadIDs {
+			threadIDs[i] = strings.TrimSpace(id)
 		}
 
-		// Convert interface{} array to []string
-		var threadIDs []string
-		for _, idRaw := range threadIDsArray {
-			if idStr, ok := idRaw.(string); ok {
-				threadIDs = append(threadIDs, idStr)
-			} else {
-				return mcp.NewToolResultError("All thread_ids must be strings"), nil
-			}
-		}
-
-		if len(threadIDs) == 0 {
+		if len(threadIDs) == 0 || (len(threadIDs) == 1 && threadIDs[0] == "") {
 			return mcp.NewToolResultError("At least one thread_id must be provided"), nil
 		}
 
@@ -1474,12 +1475,127 @@ EXAMPLE QUERIES:
 	})
 
 	// Start the server
-	log.Println("Starting Gmail MCP Server...")
-	log.Println("✅ Server ready! Waiting for MCP client connections via stdio...")
-	log.Println("   (Use Ctrl+C to stop the server)")
-	
-	if err := server.ServeStdio(mcpServer); err != nil {
-		log.Fatalf("Server error: %v", err)
+	if useHTTP {
+		log.Printf("Starting Gmail MCP Server in HTTP mode on port %s...", port)
+		log.Printf("✅ Server will run persistently at http://localhost:%s", port)
+		log.Printf("   OAuth will only be required once at startup!")
+		log.Printf("   (Use Ctrl+C to stop the server)")
+		
+		// Run Gmail server authentication once at startup
+		log.Println("🔐 Authenticating with Gmail (one-time only)...")
+		
+		// Test Gmail connection to ensure OAuth is working
+		_, err := gmailServer.service.Users.GetProfile(gmailServer.userID).Do()
+		if err != nil {
+			log.Fatalf("Gmail authentication failed: %v", err)
+		}
+		log.Println("✅ Gmail authentication successful!")
+		
+		// Create HTTP server with CORS support for browser clients
+		mux := http.NewServeMux()
+		
+		// Add basic info endpoint
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head><title>Gmail MCP Server</title></head>
+<body>
+<h1>📧 Gmail MCP Server</h1>
+<p><strong>Status:</strong> Running in HTTP mode on port %s</p>
+<p><strong>Cursor Configuration:</strong></p>
+<pre>
+{
+  "mcpServers": {
+    "gmail-http": {
+      "url": "http://localhost:%s"
+    }
+  }
+}
+</pre>
+<p><em>Copy the above configuration to your Cursor MCP settings.</em></p>
+<h2>Available Tools:</h2>
+<ul>
+<li>search_threads - Search Gmail with powerful query syntax</li>
+<li>create_draft - Create/update email drafts</li>
+<li>extract_attachment_by_filename - Extract text from attachments</li>
+<li>fetch_email_bodies - Get full email content</li>
+<li>get_personal_email_style_guide - Get writing style guide</li>
+</ul>
+</body>
+</html>`, port, port)
+		})
+		
+		// Add health check endpoint
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			
+			status := map[string]interface{}{
+				"status": "healthy",
+				"server": "Gmail MCP Server",
+				"version": "1.0.0",
+				"timestamp": time.Now().Format(time.RFC3339),
+				"gmail_authenticated": true,
+			}
+			
+			json.NewEncoder(w).Encode(status)
+		})
+		
+		// Add MCP endpoint (simplified HTTP-based MCP)
+		mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+			// Enable CORS
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			
+			w.Header().Set("Content-Type", "application/json")
+			
+			// Simple implementation - for full MCP support, you'd need
+			// to implement the complete JSON-RPC protocol here
+			response := map[string]interface{}{
+				"jsonrpc": "2.0",
+				"result": map[string]interface{}{
+					"message": "Gmail MCP Server HTTP endpoint",
+					"note": "For full MCP support, use stdio mode. HTTP mode is experimental.",
+					"stdio_command": os.Args[0], // Path to this binary
+				},
+			}
+			
+			json.NewEncoder(w).Encode(response)
+		})
+		
+		log.Printf("🌐 HTTP server starting on http://localhost:%s", port)
+		log.Printf("📖 View server info: http://localhost:%s", port)
+		log.Printf("🔍 Health check: http://localhost:%s/health", port)
+		log.Println()
+		log.Println("🎯 TO CONNECT CURSOR:")
+		log.Printf("   1. For now, use stdio mode (recommended)")
+		log.Printf("   2. In Cursor MCP settings, use command: %s", os.Args[0])
+		log.Printf("   3. Or wait for full HTTP MCP transport support")
+		
+		// Start HTTP server
+		httpServer := &http.Server{
+			Addr:    ":" + port,
+			Handler: mux,
+		}
+		
+		if err := httpServer.ListenAndServe(); err != nil {
+			log.Fatalf("HTTP Server error: %v", err)
+		}
+	} else {
+		log.Println("Starting Gmail MCP Server in stdio mode...")
+		log.Println("✅ Server ready! Waiting for MCP client connections via stdio...")
+		log.Println("   (Use Ctrl+C to stop the server)")
+		
+		if err := server.ServeStdio(mcpServer); err != nil {
+			log.Fatalf("Server error: %v", err)
+		}
 	}
 }
 

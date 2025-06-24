@@ -8,7 +8,7 @@ require (
 	github.com/JohannesKaufmann/html-to-markdown/v2 v2.3.3
 	github.com/joho/godotenv v1.5.1
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
-	github.com/mark3labs/mcp-go v0.31.0
+	github.com/mark3labs/mcp-go v0.32.0
 	github.com/nguyenthenguyen/docx v0.0.0-20230621112118-9c8e795a11db
 	github.com/openai/openai-go v1.3.0
 	golang.org/x/oauth2 v0.30.0

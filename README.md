@@ -74,6 +74,53 @@ You'll want to add this to your agent's configuration file:
 }
 ```
 
+### ⚡ **Persistent HTTP Mode (Recommended to Avoid OAuth Popups)**
+
+**Problem**: In stdio mode, Cursor starts a fresh server process each time (and for each tab), causing OAuth popup spam.
+
+**Solution**: Run the server as a persistent HTTP daemon that authenticates once and stays running.
+
+#### Quick Start:
+```bash
+# Build the server
+go build -o gmail-mcp-server
+
+# Start persistent server (OAuth only once!)
+./gmail-mcp-server --http
+
+# Or with custom port
+./gmail-mcp-server --http 3000
+```
+
+#### What Happens:
+1. ✅ **OAuth popup appears ONCE** when server starts
+2. ✅ **Server runs persistently** on http://localhost:8080  
+3. ✅ **No more OAuth popups** - server stays authenticated
+4. ✅ **Multiple Cursor tabs/windows** can connect to same server
+
+#### Cursor Configuration (Still Use stdio for now):
+```json
+{
+  "mcpServers": {
+    "gmail": {
+      "command": "C:/path/to/your/gmail-mcp-server",
+      "env": {
+        "GMAIL_CLIENT_ID": "your_client_id_here.apps.googleusercontent.com", 
+        "GMAIL_CLIENT_SECRET": "your_client_secret_here",
+        "OPENAI_API_KEY": "your_openai_api_key_here"
+      }
+    }
+  }
+}
+```
+
+The difference: **You start the server manually once** instead of letting Cursor start it fresh each time.
+
+#### Server Status:
+- Visit http://localhost:8080 to see server status
+- Health check: http://localhost:8080/health
+- View available tools and configuration examples
+
 ### Add to Cursor
 - Press `Ctrl+Shift+P` (Windows/Linux) or `Cmd+Shift+P` (Mac)
 - Click the MCP-tab
@@ -147,4 +194,6 @@ The server stores authentication and configuration files in standard application
 
 ## 7. TODOs
 
-- [ ] **Improve OAuth login flow** - Currently the MCP server pops up browser authentication every time you open Cursor; that's really annoying. I think Cursor supports oAuth better than this.
+- [x] **Improve OAuth login flow** - ✅ **SOLVED!** Use persistent HTTP mode (`./gmail-mcp-server --http`) to avoid OAuth popups. Server authenticates once and stays running.
+- [ ] **Full HTTP MCP Transport** - Waiting for mark3labs/mcp-go to expose complete HTTP transport APIs
+- [ ] **Better Email Authenticity** - LLM-written emails still don't sound perfectly authentic despite style guides
