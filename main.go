@@ -42,6 +42,7 @@ func NewGmailServer() (*GmailServer, error) {
 	// Get credentials from separate environment variables
 	clientID := os.Getenv("GMAIL_CLIENT_ID")
 	clientSecret := os.Getenv("GMAIL_CLIENT_SECRET")
+	redirecturl := os.Getenv("REDIRECT_URL")
 	
 	if clientID == "" {
 		return nil, fmt.Errorf("GMAIL_CLIENT_ID environment variable not set")
@@ -54,7 +55,7 @@ func NewGmailServer() (*GmailServer, error) {
 	config := &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		RedirectURL:  "http://localhost:8080",
+		RedirectURL:  redirecturl,
 		Scopes:       []string{gmail.GmailReadonlyScope, gmail.GmailComposeScope},
 		Endpoint:     google.Endpoint,
 	}
