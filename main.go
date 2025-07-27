@@ -183,7 +183,7 @@ func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Update the redirect URI to point to our local server
-	config.RedirectURL = "http://localhost:8080"
+	config.RedirectURL = os.Getenv("REDIRECT_URL")
 	
 	// Generate the authorization URL
 	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
